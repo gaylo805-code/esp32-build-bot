@@ -20,8 +20,9 @@ fi
 # shellcheck disable=SC1090
 set -a; . "$ENV_FILE"; set +a
 
-: "${TELEGRAM_BOT_TOKEN:?thiếu TELEGRAM_BOT_TOKEN trong $ENV_FILE}"
-: "${TELEGRAM_CHAT_ID:?thiếu TELEGRAM_CHAT_ID trong $ENV_FILE}"
+export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:?thiếu TELEGRAM_BOT_TOKEN trong $ENV_FILE}"
+# TELEGRAM_CHAT_ID is optional: if blank, the bot locks onto whoever messages
+# it first and persists that id to bot_state/chat_id.
 
 export IDF_PATH="${IDF_PATH:-/opt/esp/idf}"
 export IDF_VERSION="${IDF_VERSION:-v5.1.4}"
@@ -32,8 +33,15 @@ export TELEGRAM_OFFSET_FILE="${TELEGRAM_OFFSET_FILE:-$ROOT/bot_state/offset}"
 export BOT_WORKDIR="${BOT_WORKDIR:-$ROOT/bot_work}"
 export PYTHONUNBUFFERED=1
 
-mkdir -p "$TELEGRAM_OFFSET_FILE" 2>/dev/null || true
 mkdir -p "$(dirname "$TELEGRAM_OFFSET_FILE")" "$BOT_WORKDIR" "$CCACHE_DIR"
+
+# If a previous bug (or a stray mkdir) left the offset path as a directory,
+# remove it - otherwise offset can never persist and the bot re-sends
+# firmware for the same zip after every restart.
+if [ -d "$TELEGRAM_OFFSET_FILE" ]; then
+  echo "[run_local] $TELEGRAM_OFFSET_FILE là thư mục, xoá để tạo file"
+  rmdir "$TELEGRAM_OFFSET_FILE" 2>/dev/null || rm -rf "$TELEGRAM_OFFSET_FILE"
+fi
 
 # Sloppiness giúp ccache hit khi file được restore từ nơi khác.
 command -v ccache >/dev/null 2>&1 && \

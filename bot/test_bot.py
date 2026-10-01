@@ -193,6 +193,17 @@ def main():
     check("offset round-trips", bot.load_offset() == 99, bot.load_offset())
     check("offset written to disk", st.read_text().strip() == "99")
 
+    # Regression: run_local.sh once did `mkdir -p $TELEGRAM_OFFSET_FILE`,
+    # leaving a DIRECTORY at that path. The offset then never persisted and the
+    # bot re-sent firmware for zips it had already handled after each restart.
+    stdir = Path(tempfile.mkdtemp()) / "offset"
+    stdir.mkdir()
+    bot.OFFSET_FILE = stdir
+    bot.save_offset(7)
+    check("save_offset replaces dir at path with a file",
+          stdir.is_file() and stdir.read_text().strip() == "7")
+    check("offset loadable after self-heal", bot.load_offset() == 7)
+
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()
     calls = {"build": 0}

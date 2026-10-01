@@ -20,7 +20,7 @@ import zipfile
 from pathlib import Path
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 IDF_PATH = os.environ.get("IDF_PATH", "/opt/esp/idf")
 IDF_VERSION = os.environ.get("IDF_VERSION", "v5.1.4")
 
@@ -40,6 +40,31 @@ FILE_BASE = os.environ.get(
 # job restart would reprocess and re-send firmware for the same zip.
 OFFSET_FILE = Path(os.environ.get("TELEGRAM_OFFSET_FILE", "bot_state/offset"))
 
+# When no chat id is configured yet, the bot locks onto whoever messages it
+# first and persists that id, so the setup only needs the BotFather token.
+CHAT_FILE = Path(os.environ.get("TELEGRAM_CHAT_FILE", "bot_state/chat_id"))
+
+
+def load_chat_id():
+    global CHAT_ID
+    if CHAT_ID:
+        return CHAT_ID
+    try:
+        CHAT_ID = CHAT_FILE.read_text().strip()
+    except Exception:
+        CHAT_ID = ""
+    return CHAT_ID
+
+
+def lock_chat(chat_id):
+    global CHAT_ID
+    CHAT_ID = str(chat_id)
+    try:
+        CHAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CHAT_FILE.write_text(CHAT_ID)
+    except Exception as e:
+        log(f"could not persist chat id: {e}")
+
 
 def load_offset():
     try:
@@ -53,6 +78,12 @@ def save_offset(offset):
         return
     try:
         OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Self-heal: a stray `mkdir -p` on this path would leave a directory
+        # here, and the offset would silently never persist (causing duplicate
+        # firmware sends after every restart).
+        if OFFSET_FILE.is_dir():
+            log(f"{OFFSET_FILE} was a directory - replacing with file")
+            shutil.rmtree(OFFSET_FILE, ignore_errors=True)
         OFFSET_FILE.write_text(str(offset))
     except Exception as e:
         log(f"could not persist offset: {e}")
@@ -175,8 +206,35 @@ def preflight(root: Path):
 
 
 def run(cmd, cwd=None, timeout=1800):
-    return subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str),
-                          capture_output=True, text=True, timeout=timeout)
+    """Run a shell command under bash.
+
+    Must NOT use /bin/sh: ESP-IDF's export.sh uses bash-only syntax such as
+    [[ ]] and would abort with "[[: not found" under dash.
+    """
+    if isinstance(cmd, str):
+        return subprocess.run(["/bin/bash", "-c", cmd], cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def extract_errors(text):
+    """Pull the lines a human actually needs out of an IDF build log.
+
+    A failing build ends with hundreds of lines of unrelated linker noise, so
+    returning only the tail buries the real error.
+    """
+    if not text:
+        return text
+    keep = []
+    for line in text.splitlines():
+        low = line.lower()
+        if ("error:" in low or "fatal:" in low or "undefined reference" in low
+                or "traceback" in low or "::error" in low
+                or "command failed" in low or "no such file" in low):
+            keep.append(line)
+    if keep:
+        return "\n".join(keep[-12:])
+    return text[-1200:]
 
 
 def build_target(root: Path, target: str):
@@ -188,13 +246,13 @@ def build_target(root: Path, target: str):
                  f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache set-target {target}",
                  cwd=root, timeout=900)
         if p1.returncode != 0:
-            return False, None, (p1.stdout + p1.stderr)[-4000:]
+            return False, None, extract_errors(p1.stdout + p1.stderr)
         p2 = run(f". {IDF_PATH}/export.sh && idf.py "
                  f"-DCMAKE_C_COMPILER_LAUNCHER=ccache "
                  f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache build",
                  cwd=root, timeout=1800)
         if p2.returncode != 0:
-            return False, None, (p2.stdout + p2.stderr)[-4000:]
+            return False, None, extract_errors(p2.stdout + p2.stderr)
         logtxt = ""
         if logdir.is_dir():
             for f in sorted(logdir.glob("idf_py_std*")):
@@ -270,9 +328,11 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
 
         for target, merged, out in results:
             if merged is None:
+                err_txt = extract_errors(out)
                 send_message(
-                    f"❌ <b>{target}</b> build lỗi sau {dt}s — xem log bên dưới.\n\n"
-                    f"<pre>{_escape(out or 'không rõ')[-1500:]}</pre>",
+                    f"❌ <b>{target}</b> build lỗi sau {dt}s\n\n"
+                    f"<pre>{_escape(err_txt)}</pre>\n\n"
+                    f"💡 Gửi lại zip đã sửa, hoặc xem file log đầy đủ.",
                     msg_id,
                 )
             else:
@@ -303,6 +363,8 @@ def _escape(s):
 # --------------------------------------------------------------------------
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
+    known = load_chat_id()
+    log(f"chat id: {known or 'chưa thiết lập (sẽ lấy từ người nhắn đầu tiên)'}")
     deadline = time.time() + MAX_SECONDS
     offset = load_offset()
     if offset:
@@ -316,7 +378,8 @@ def main():
         log("FATAL: token invalid or network down")
         return 1
 
-    send_message("🤖 Bot đã sẵn sàng. Gửi file .zip dự án ESP-IDF để build.")
+    send_message("🤖 Bot đã sẵn sàng. Gửi file .zip dự án ESP-IDF để build.") \
+        if CHAT_ID else log("Chưa có chat id — nhắn /start cho bot để thiết lập.")
 
     while time.time() < deadline:
         payload = {"timeout": POLL_TIMEOUT}
@@ -342,6 +405,10 @@ def main():
             save_offset(offset)
             msg = upd.get("message") or {}
             chat = msg.get("chat", {})
+            if not CHAT_ID and chat.get("id"):
+                # First person to talk to an unconfigured bot owns it.
+                lock_chat(chat["id"])
+                log(f"locked onto chat {CHAT_ID}")
             if str(chat.get("id")) != str(CHAT_ID):
                 continue  # ignore anyone else
             last_activity = time.time()
