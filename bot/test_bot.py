@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import threading
 import urllib.request
 import zipfile
@@ -320,6 +321,49 @@ def main():
     print("== safe_name ==")
     check("strips slashes", "/" not in bot.safe_name("a/b/c"))
     check("keeps normal name", bot.safe_name("my-proj_v1") == "my-proj_v1")
+
+    print("== progress updates are throttled (429 regression) ==")
+    # Regression: the per-step callback used force=True, bypassing the
+    # throttle and firing ~900 API calls per build -> HTTP 429 flooded the
+    # chat and froze the progress bar.
+    EDITS.clear()
+    st = bot.Status("start", None)
+    st.message_id = 1
+    st.last_send = time.time()
+    st.last_text = None
+    st.blocked_until = 0.0
+    for i in range(900):
+        st.update(f"step {i}/900")          # exactly how the callback calls it
+    check("900 steps -> few API calls", len(EDITS) <= 2, len(EDITS))
+
+    EDITS.clear()
+    st2 = bot.Status("start", None)
+    st2.message_id = 2
+    st2.last_send = 0.0
+    st2.last_text = None
+    st2.blocked_until = 0.0
+    st2.min_interval = 0.0
+    for i in range(5):
+        st2.update(f"same text")
+    check("identical text not re-sent", len(EDITS) <= 1, len(EDITS))
+
+    st3 = bot.Status("s", None)
+    st3.message_id = 3
+    st3.blocked_until = time.time() + 30
+    st3.last_send = 0.0
+    st3.last_text = None
+    EDITS.clear()
+    st3.update("during backoff", force=True)
+    check("backoff blocks even force updates", len(EDITS) == 0, len(EDITS))
+
+    print("== no zombie child after streaming ==")
+    rc3, _ = bot.run_streaming("sleep 0.1; echo '[1/1] done'", cwd="/tmp")
+    check("fast command returns", rc3 == 0, rc3)
+    rc4, out4 = bot.run_streaming(
+        "for i in $(seq 1 5); do echo \"[$i/5] s\"; done; exit 3", cwd="/tmp")
+    check("propagates exit code", rc4 == 3, rc4)
+    rc5, _ = bot.run_streaming("echo '[1/1] x'; kill -9 $$", cwd="/tmp")
+    check("survives killed child", rc5 != 0)
 
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()

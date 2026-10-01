@@ -116,18 +116,20 @@ def api(method, payload=None, timeout=60):
 class Status:
     """A single Telegram message that is edited in place to show progress.
 
-    Editing one message avoids flooding the chat and stays well inside the
-    Bot API editMessageText rate limit.
+    Editing one message avoids flooding the chat, but the Bot API rate-limits
+    edits hard. Every edit is therefore throttled, and a 429 makes us back off
+    for exactly as long as Telegram asks instead of retrying into the wall.
     """
 
     BAR = "░░░░░░░░░░"
 
-    def __init__(self, initial, reply_to=None, min_interval=4.0):
+    def __init__(self, initial, reply_to=None, min_interval=6.0):
         self.reply_to = reply_to
         self.min_interval = min_interval
         self.message_id = None
         self.last_text = None
         self.last_send = 0.0
+        self.blocked_until = 0.0
         r = send_message(initial, reply_to)
         if r and r.get("ok"):
             self.message_id = r["result"]["message_id"]
@@ -136,15 +138,28 @@ class Status:
         now = time.time()
         if not self.message_id:
             return
+        if now < self.blocked_until:
+            return
+        # Throttle unless this is a discrete state change. force=True must
+        # never be used from the per-step build callback: that would fire one
+        # API call per ninja line (~900 calls) and trip HTTP 429.
         if not force and now - self.last_send < self.min_interval:
             return
         if text == self.last_text:
             return
         self.last_send = now
         self.last_text = text
-        api("editMessageText", {"chat_id": CHAT_ID, "message_id": self.message_id,
-                                "text": text, "disable_web_page_preview": True},
-            timeout=20)
+        r = api("editMessageText",
+                {"chat_id": CHAT_ID, "message_id": self.message_id,
+                 "text": text, "disable_web_page_preview": True},
+                timeout=20)
+        if r and not r.get("ok"):
+            retry = 20
+            params = r.get("parameters") or {}
+            if isinstance(params, dict):
+                retry = params.get("retry_after", retry)
+            self.blocked_until = time.time() + float(retry) + 1
+            log(f"rate limited, pausing progress updates for {retry}s")
 
     def bar(self, done, total):
         frac = (done / total) if total else 0.0
@@ -379,23 +394,35 @@ def run_streaming(cmd, cwd, on_progress=None, timeout=2400):
                             text=True, bufsize=1)
     lines = []
     deadline = time.time() + timeout
+    rc = 1
     try:
-        for line in proc.stdout:
-            lines.append(line)
-            if on_progress:
-                m = PROGRESS_RE.search(line)
-                if m:
-                    on_progress(int(m.group(1)), int(m.group(2)))
-            if time.time() > deadline:
-                proc.kill()
-                return 124, "".join(lines)[-4000:]
-    finally:
         try:
-            proc.stdout.close()
-        except Exception:
-            pass
-    proc.wait()
-    return proc.returncode, "".join(lines)
+            for line in proc.stdout:
+                lines.append(line)
+                if on_progress:
+                    m = PROGRESS_RE.search(line)
+                    if m:
+                        on_progress(int(m.group(1)), int(m.group(2)))
+                if time.time() > deadline:
+                    proc.kill()
+                    log("build timed out")
+                    return 124, "".join(lines)[-4000:]
+        finally:
+            # Must always reap: otherwise a killed/timed-out build leaves a
+            # zombie child attached to the bot for the rest of the session.
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
+    except Exception as e:
+        log(f"streaming build aborted: {e}")
+        return rc or 1, "".join(lines)[-4000:]
+    return rc, "".join(lines)
 
 
 def build_target(root: Path, target: str, status=None, prefix=""):
@@ -425,10 +452,11 @@ def build_target(root: Path, target: str, status=None, prefix=""):
                 timing = f"⏱ {elapsed}s đã trôi qua · ETA ~{eta}s"
             else:
                 timing = f"⏱ {elapsed}s · đang ước lượng…"
+            # No force=True here: this fires once per ninja line (~900 times)
+            # and rate limiting would freeze the progress bar entirely.
             status.update(
                 f"🔨 <b>{prefix}</b> {status.bar(done, total)} "
-                f"<b>{pct}%</b>  {done}/{total}\n{timing}",
-                force=True)
+                f"<b>{pct}%</b>  {done}/{total}\n{timing}")
 
         rc, out = run_streaming(
             f". {IDF_PATH}/export.sh && idf.py "
@@ -544,6 +572,13 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
         # work on the next upload. Only the downloaded zip is transient.
         for leftover in workdir.glob("*.bin"):
             leftover.unlink(missing_ok=True)
+        # Sweep any zip left behind by an earlier failed/crashed build.
+        for old_zip in WORK.glob("in-*.zip"):
+            try:
+                if old_zip.stat().st_mtime < time.time() - 3600:
+                    old_zip.unlink()
+            except Exception:
+                pass
 
 
 def _escape(s):
