@@ -15,6 +15,17 @@ Ngoài ra:
 - `idf.py set-target` chỉ chạy một lần vì `build/` được restore.
 - Artifact `.bin` tải về bằng link trong Actions run.
 
+## Số đo thực tế (đo local trên ubuntu, ESP-IDF v5.1.4)
+
+| Tình huống | Thời gian |
+|---|---|
+| Build lạnh (không ccache) | 45s |
+| Build lạnh + ccache đã có đủ object | 12.4s (842/842 hit, 100% direct hit) |
+| Rebuild incremental, chỉ 1 file đổi | 5.3s |
+| Clone + `install.sh` (tầng 1 miss) | ~6 phút |
+
+Tức là từ ~6 phút (run đầu) xuống **~12 giây** cho các run sau khi cache ấm.
+
 ## Dùng
 
 ```bash
