@@ -1,0 +1,168 @@
+name: Build from ZIP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'uploads/*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Tên file .zip trong thư mục uploads/'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-zip:
+    name: Build & merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32, esp32s3]
+
+    env:
+      IDF_VERSION: v5.1.4
+      IDF_PATH: /opt/esp/idf
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Toolchain dùng chung với workflow build.yml (cùng key -> 1 bản duy nhất).
+      - name: Cache ESP-IDF toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/esp/idf
+            ~/.espressif
+          key: idf-${{ env.IDF_VERSION }}-toolchain-${{ runner.os }}
+          restore-keys: |
+            idf-${{ env.IDF_VERSION }}-toolchain-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.target }}-${{ runner.os }}
+
+      - name: Configure ccache
+        run: |
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ccache
+          fi
+          ccache --set-config=sloppiness=file_stat_matches,include_file_mtime,include_file_ctime,time_macros,locale
+
+      - name: Install ESP-IDF (skipped on cache hit)
+        run: |
+          if [ -d "$IDF_PATH/tools" ] && [ -x "$IDF_PATH/export.sh" ]; then
+            echo "Toolchain restored from cache."
+          else
+            git clone -b "$IDF_VERSION" --depth 1 --recursive \
+              https://github.com/espressif/esp-idf.git "$IDF_PATH"
+            cd "$IDF_PATH"
+            ./install.sh esp32,esp32s3
+          fi
+
+      # Bỏ qua nếu chưa có zip nào trong uploads/
+      - name: Find project ZIP
+        id: zip
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FILE="uploads/${{ inputs.zip_name }}"
+          else
+            FILE=$(ls -1t uploads/*.zip 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No .zip found in uploads/ - nothing to build."
+            exit 0
+          fi
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "name=$(basename "$FILE" .zip)" >> $GITHUB_OUTPUT
+
+      - name: Extract project
+        if: steps.zip.outputs.found == 'true'
+        run: |
+          rm -rf workspace && mkdir -p workspace
+          unzip -q "${{ steps.zip.outputs.file }}" -d workspace
+          # Nhiều tool zip tạo sẵn thư mục gốc bên trong (proj/...).
+          ROOT=$(find workspace -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [ -z "$ROOT" ] || [ ! -f "$ROOT/CMakeLists.txt" ]; then
+            ROOT=$(find workspace -name CMakeLists.txt -maxdepth 3 -not -path '*/build/*' | head -1)
+            ROOT=$(dirname "$ROOT")
+          fi
+          if [ -z "$ROOT" ]; then
+            echo "::error::Không tìm thấy CMakeLists.txt trong zip"
+            exit 1
+          fi
+          echo "ROOT=$ROOT" >> $GITHUB_ENV
+          echo "Building project at: $ROOT"
+
+      - name: Build
+        if: steps.zip.outputs.found == 'true'
+        run: |
+          . $IDF_PATH/export.sh
+          cd "$ROOT"
+          idf.py -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                 set-target ${{ matrix.target }}
+          idf.py -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                 build
+          APP=$(ls -1 build/*.bin | grep -v -E 'bootloader|partition|ota_data' | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::Không tìm thấy file .bin ứng dụng trong build/"
+            exit 1
+          fi
+          echo "APP_BIN=$(basename "$APP")" >> $GITHUB_ENV
+          echo "Project=${{ steps.zip.outputs.name }}" >> $GITHUB_ENV
+
+      # Gộp 4 file thành 1 file .bin duy nhất, flash ở offset 0x0.
+      - name: Merge to single firmware
+        if: steps.zip.outputs.found == 'true'
+        run: |
+          . $IDF_PATH/export.sh
+          cd "$ROOT"
+          NAME="${PROJECT:-firmware}-${{ matrix.target }}.bin"
+          python -m esptool --chip ${{ matrix.target }} merge_bin \
+            --format raw --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            -o "$NAME" \
+            0x0    build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0xe000 build/ota_data_initial.bin \
+            0x10000 "build/$APP_BIN"
+          echo "MERGED=$NAME" >> $GITHUB_ENV
+          ls -la "$NAME"
+
+      - name: ccache stats
+        if: always() && steps.zip.outputs.found == 'true'
+        run: ccache -s || true
+
+      - name: Upload merged firmware
+        if: steps.zip.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.name }}-${{ matrix.target }}-merged
+          path: ${{ env.ROOT }}/${{ env.MERGED }}
+          retention-days: 14
+
+      - name: Upload logs (on failure)
+        if: failure() && steps.zip.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.target }}
+          path: |
+            ${{ env.ROOT }}/build/log/
+          retention-days: 3
