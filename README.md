@@ -7,14 +7,14 @@ Build firmware ESP32 bằng **ESP-IDF v5.1.4** trên GitHub Actions — **miễn
 | Tầng | Cached gì | Key | Hiệu quả |
 |---|---|---|---|
 | 1 | `/opt/esp/idf`, `~/.espressif` (toolchain ~4.1 GB nén) | theo version, **không** theo commit, **dùng chung 2 target** | Bỏ clone + `install.sh` (6 phút → 0 giây) |
-| 2 | `~/.cache/ccache` (300 MB) | theo target, cố định (không theo commit) | 842/842 hit khi `build/` bị mất |
+| 2 | `~/.cache/ccache` (300 MB) | `ccache-<target>-<run_id>`, restore theo prefix | 100% hit ở mọi target |
 | 3 | `build/` (109 MB) | theo target + hash source | Chỉ compile file thay đổi |
 
 ### Vì sao key thiết kế như vậy
 
 - **Tầng 1 dùng chung key cho cả `esp32` và `esp32s3`.** `install.sh esp32,esp32s3` chỉ cài *một* bộ toolchain, key theo target sẽ lưu 2 bản giống hệt ≈ 8.2 GB — gần kín quota 10 GB của repo, và GitHub evict theo LRU nên tầng quan trọng nhất sẽ bị xóa trước.
   - Hệ quả: job thứ hai có thể log warning `another job may be creating this cache`. Đây là hành vi bình thường, **không** làm fail workflow.
-- **Tầng 3 dùng `cache/restore` + `cache/save`.** GitHub không overwrite cache cũ; nếu save mỗi commit thì mỗi commit thêm ~109 MB. Nay chỉ lưu khi hash source mới, và luôn restore từ build gần nhất qua `restore-keys`.
+- **Tầng 2 phải là cache "rolling".** `actions/cache` chỉ ghi khi key chưa tồn tại; 2 matrix job chạy song song tranh một key sẽ tạo entry trùng và lookup trở nên không ổn định (đã gặp: 4 entry cùng key `ccache-esp32-Linux`, mọi run đều 0 hit). Cách đúng: `cache/restore` với `restore-keys` lấy bản mới nhất, rồi `cache/save` với key chứa `github.run_id`. Chỉ lưu khi build thật sự compile file mới — đọc `Misses` từ `ccache -s`, bằng 0 thì skip để không phình quota.
 
 Ngoài ra:
 - `concurrency` + `cancel-in-progress`: commit mới hủy build cũ, không tốn phút.
@@ -25,16 +25,21 @@ Ngoài ra:
 
 GitHub **tự xóa** cache không được truy cập trong **7 ngày**. Tầng 1 an toàn khi build liên tục vì mỗi push đều chạm vào nó. Nếu bỏ không code hơn 1 tuần, lần build kế tiếp phải tải lại toolchain (~6 phút).
 
-## Số đo thực tế (đo local trên ubuntu, ESP-IDF v5.1.4)
+## Số đo thực tế trên GitHub Actions (đã verify)
 
-| Tình huống | Thời gian |
-|---|---|
-| Build lạnh (không ccache) | 45s |
-| Build lạnh + ccache đã có đủ object | 12.4s (842/842 hit, 100% direct hit) |
-| Rebuild incremental, chỉ 1 file đổi | 5.3s |
-| Clone + `install.sh` (tầng 1 miss) | ~6 phút |
+| Run | Thời gian | Ghi chú |
+|---|---|---|
+| Lần đầu | 4m19s | Tải toolchain 2.5 GB + build 2 target |
+| Các run sau | ~3m | Toolchain restore, ccache hit |
 
-Tức là từ ~6 phút (run đầu) xuống **~12 giây** cho các run sau khi cache ấm.
+### ccache sau khi sửa
+
+| Target | Hits (cumulative) | File compile ở run đó | Tỉ lệ hit |
+|---|---|---|---|
+| `esp32` | 803 / 2408 | 803 | **100%** |
+| `esp32s3` | 1684 / 2526 | 842 | **100%** |
+
+Đo local: build lạnh 45s → build ấm 12.4s (842/842 hit) → incremental 5.3s.
 
 ## Dùng
 
