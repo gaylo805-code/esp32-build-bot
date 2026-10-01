@@ -6,14 +6,24 @@ Build firmware ESP32 bằng **ESP-IDF v5.1.4** trên GitHub Actions — **miễn
 
 | Tầng | Cached gì | Key | Hiệu quả |
 |---|---|---|---|
-| 1 | `/opt/esp/idf`, `~/.espressif` (~2 GB toolchain + python env) | theo version, **không** theo commit | Bỏ qua bước clone + `install.sh` (5–8 phút → 0 giây) |
-| 2 | `build/` (đối tượng .o đã compile) | hash source + `restore-keys` fallback | Chỉ compile file thay đổi |
-| 3 | `~/.cache/ccache` (500 MB, nén) | theo source | Compile lại file đã từng build ở runner khác → cache hit |
+| 1 | `/opt/esp/idf`, `~/.espressif` (toolchain ~4.1 GB nén) | theo version, **không** theo commit, **dùng chung 2 target** | Bỏ clone + `install.sh` (6 phút → 0 giây) |
+| 2 | `~/.cache/ccache` (300 MB) | theo target, cố định (không theo commit) | 842/842 hit khi `build/` bị mất |
+| 3 | `build/` (109 MB) | theo target + hash source | Chỉ compile file thay đổi |
+
+### Vì sao key thiết kế như vậy
+
+- **Tầng 1 dùng chung key cho cả `esp32` và `esp32s3`.** `install.sh esp32,esp32s3` chỉ cài *một* bộ toolchain, key theo target sẽ lưu 2 bản giống hệt ≈ 8.2 GB — gần kín quota 10 GB của repo, và GitHub evict theo LRU nên tầng quan trọng nhất sẽ bị xóa trước.
+  - Hệ quả: job thứ hai có thể log warning `another job may be creating this cache`. Đây là hành vi bình thường, **không** làm fail workflow.
+- **Tầng 3 dùng `cache/restore` + `cache/save`.** GitHub không overwrite cache cũ; nếu save mỗi commit thì mỗi commit thêm ~109 MB. Nay chỉ lưu khi hash source mới, và luôn restore từ build gần nhất qua `restore-keys`.
 
 Ngoài ra:
 - `concurrency` + `cancel-in-progress`: commit mới hủy build cũ, không tốn phút.
-- `idf.py set-target` chỉ chạy một lần vì `build/` được restore.
+- `idf.py set-target` chỉ chạy khi `build/` không được restore (nó xóa sạch `build/`).
 - Artifact `.bin` tải về bằng link trong Actions run.
+
+### Vòng đời cache
+
+GitHub **tự xóa** cache không được truy cập trong **7 ngày**. Tầng 1 an toàn khi build liên tục vì mỗi push đều chạm vào nó. Nếu bỏ không code hơn 1 tuần, lần build kế tiếp phải tải lại toolchain (~6 phút).
 
 ## Số đo thực tế (đo local trên ubuntu, ESP-IDF v5.1.4)
 

@@ -39,8 +39,12 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------------
-      # 1) ESP-IDF toolchain (~2 GB) - the slowest part, cache forever.
-      #    Key does NOT include a commit hash, so this hits on every run.
+      # 1) ESP-IDF toolchain (~4.1 GB uncompressed) - the slowest part.
+      #    Key is SHARED between matrix targets on purpose: install.sh
+      #    installs one toolchain for both, so keying per target would
+      #    store two identical 4 GB copies and blow the 10 GB repo quota,
+      #    which evicts this most valuable cache first.
+      #    Key has no commit hash, so this hits on every run.
       # ---------------------------------------------------------------
       - name: Cache ESP-IDF toolchain
         uses: actions/cache@v4
@@ -48,31 +52,56 @@ jobs:
           path: |
             /opt/esp/idf
             ~/.espressif
-            ~/.platformio
-          key: idf-${{ matrix.idf }}-${{ matrix.target }}-toolchain-${{ runner.os }}
+          key: idf-${{ matrix.idf }}-toolchain-${{ runner.os }}
           restore-keys: |
-            idf-${{ matrix.idf }}-${{ matrix.target }}-toolchain-
             idf-${{ matrix.idf }}-toolchain-
 
-      - name: Cache build artifacts (incremental compile)
+      # ---------------------------------------------------------------
+      # 2) ccache - separate from build/ because it is keyed by target
+      #    (esp32 and esp32s3 objects are not interchangeable) but has
+      #    no per-commit granularity worth the storage.
+      # ---------------------------------------------------------------
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: |
-            build
-            ~/.cache/ccache
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.target }}-${{ runner.os }}
+
+      # ---------------------------------------------------------------
+      # 3) Incremental build dir. Cached only when the source hash is new
+      #    (save-cache), always restored from the newest previous build.
+      #    Re-uploading on every commit would fill the quota quickly.
+      # ---------------------------------------------------------------
+      - name: Cache build artifacts (incremental compile)
+        uses: actions/cache/restore@v4
+        id: build-cache
+        with:
+          path: build
           key: build-${{ matrix.target }}-${{ hashFiles('**/CMakeLists.txt', '**/*.c', '**/*.h', '**/*.cpp', 'sdkconfig.defaults', 'partitions.csv', 'main/idf_component.yml') }}
           restore-keys: |
             build-${{ matrix.target }}-
-            build-
 
-      - name: Set up ccache
+      # cache/restore exposes cache-matched-key (not cache-hit).
+      # Non-empty means an existing build dir was restored.
+      - name: Record build dir restore state
+        id: build-state
+        run: echo "restored=true" >> $GITHUB_OUTPUT && [ -n "${{ steps.build-cache.outputs.cache-matched-key }}" ] || echo "restored=false" >> $GITHUB_OUTPUT
+
+      - name: Configure ccache
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache
+          # ubuntu-latest ships ccache, but install it if missing so the
+          # CMakeLists find_program() always finds it (otherwise the whole
+          # ccache tier silently degrades to a full rebuild).
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ccache
+          fi
           echo "CCACHE_DIR=$HOME/.cache/ccache" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=500M" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=300M" >> $GITHUB_ENV
           echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
-          ccache --set-config=sloppiness=file_stat_matches,include_file_mtime,include_file_ctime,time_macros
+          # Loosen time/ctime checks: GitHub runners have fresh clocks and
+          # restored files, so strict mode would produce false misses.
+          ccache --set-config=sloppiness=file_stat_matches,include_file_mtime,include_file_ctime,time_macros,locale
 
       - name: Install ESP-IDF (skipped on cache hit)
         run: |
@@ -91,12 +120,25 @@ jobs:
       - name: Build
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target $IDF_TARGET
+          # set-target wipes build/ and regenerates the whole config, so
+          # only run it when the build dir was not restored from cache.
+          if [ "${{ steps.build-state.outputs.restored }}" != "true" ] || [ ! -f build/build.ninja ]; then
+            idf.py set-target $IDF_TARGET
+          fi
           idf.py build
 
-      - name: Cache stats
+      # Must run AFTER Build, otherwise it would archive an empty/near-empty
+      # build dir. Only saved when the primary key was new.
+      - name: Save build artifacts
+        uses: actions/cache/save@v4
+        if: steps.build-cache.outputs.cache-matched-key == ''
+        with:
+          path: build
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+      - name: ccache stats
         if: always()
-        run: ccache -s || true
+        run: ccache -s || echo "ccache not available on this runner"
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
