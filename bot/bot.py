@@ -218,16 +218,104 @@ def download_file(file_id, dest: Path):
 # --------------------------------------------------------------------------
 # Build logic
 # --------------------------------------------------------------------------
+def safe_name(name):
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)[:60] or "project"
+
+
+def sync_extract(zip_path: Path, dest: Path):
+    """Extract a zip into a STABLE directory, keeping paths constant.
+
+    ccache includes the source file path in its hash, so extracting into a
+    fresh directory per build (bot_work/j<timestamp>/...) gave a ~8% hit rate.
+    Reusing one directory per project keeps the paths identical and lets
+    ccache hit on everything except files that actually changed.
+
+    A manifest of extracted paths is kept so files deleted from the new zip
+    do not linger and get compiled into stale code.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    manifest_path = dest / ".bot_manifest"
+
+    with zipfile.ZipFile(zip_path) as z:
+        if len(z.namelist()) > 20000:
+            raise RuntimeError("Zip chứa quá nhiều file (>20000)")
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        # Refuse path traversal before extracting anything.
+        for n in names:
+            target = (dest / n).resolve()
+            if not str(target).startswith(str(dest.resolve())):
+                raise RuntimeError(f"Zip chứa đường dẫn không hợp lệ: {n}")
+        # Ignore build output the uploader zipped in: its absolute paths and
+        # stale CMake cache never help, and our own persistent build dir is
+        # what makes the next upload incremental.
+        kept = []
+        for n in names:
+            parts = Path(n).parts
+            base = Path(n).name
+            if base in ("sdkconfig", "sdkconfig.old") or "build" in parts:
+                continue
+            kept.append(n)
+        z.extractall(dest, members=kept)
+
+    # Drop files that existed in the previous upload but not in this one.
+    old = set()
+    if manifest_path.is_file():
+        try:
+            old = set(manifest_path.read_text().splitlines())
+        except Exception:
+            old = set()
+    new = set(kept)
+    for stale in old - new:
+        p = dest / stale
+        try:
+            if p.is_file() or p.is_symlink():
+                p.unlink()
+        except Exception:
+            pass
+    manifest_path.write_text("\n".join(sorted(new)))
+
+    root = find_project_root(dest)
+    if root is not None and root != dest:
+        return root, dest
+    return root, dest
+
+
 def find_project_root(base: Path):
-    """Locate the directory holding CMakeLists.txt inside an extracted zip."""
+    """Locate the ESP-IDF project directory inside an extracted zip.
+
+    A project directory has CMakeLists.txt AND a main/ subdirectory. Checking
+    only for CMakeLists.txt picks main/ itself, because "main" sorts before
+    most project names.
+    """
+
+    def looks_like_project(d: Path):
+        return (d / "CMakeLists.txt").is_file() and (d / "main").is_dir()
+
+    # Zip may have no wrapping folder at all.
+    if looks_like_project(base):
+        return base
+
     for child in sorted(base.iterdir()):
-        if child.is_dir() and (child / "CMakeLists.txt").is_file():
+        if child.is_dir() and looks_like_project(child):
             return child
-    # Fallback: search a couple of levels down, ignoring build output.
+
+    # Fallback: search deeper, ignoring build output. Prefer real projects.
+    fallback = None
     for cm in sorted(base.rglob("CMakeLists.txt")):
         parts = cm.relative_to(base).parts
-        if len(parts) <= 2 and "build" not in parts:
-            return cm.parent
+        if len(parts) > 4 or "build" in parts:
+            continue
+        parent = cm.parent
+        if looks_like_project(parent):
+            return parent
+        if (fallback is None and parent.name != "main"
+                and parent != base
+                and (parent / "CMakeLists.txt").is_file()):
+            fallback = parent
+    # Return a plausible root anyway so preflight can report the real problem
+    # ("thiếu main/") instead of a vague "no CMakeLists.txt found".
+    if fallback is not None:
+        return fallback
     return None
 
 
@@ -329,11 +417,17 @@ def build_target(root: Path, target: str, status=None, prefix=""):
             pct = int(done * 100 / total) if total else 0
             elapsed = int(time.time() - state["t0"])
             rate = done / max(elapsed, 1)
-            eta = int((total - done) / rate) if rate > 0 and done else 0
+            # Early steps are cheap (config, codegen) and later ones are heavy
+            # compiles, so an ETA computed at 7% wildly overshoots. Show it only
+            # once enough of the build has run to be meaningful.
+            if rate > 0 and pct >= 15:
+                eta = int((total - done) / rate)
+                timing = f"⏱ {elapsed}s đã trôi qua · ETA ~{eta}s"
+            else:
+                timing = f"⏱ {elapsed}s · đang ước lượng…"
             status.update(
                 f"🔨 <b>{prefix}</b> {status.bar(done, total)} "
-                f"<b>{pct}%</b>  {done}/{total}\n"
-                f"⏱ {elapsed}s đã trôi qua · ETA ~{eta}s",
+                f"<b>{pct}%</b>  {done}/{total}\n{timing}",
                 force=True)
 
         rc, out = run_streaming(
@@ -374,30 +468,26 @@ def merge_firmware(build_dir: Path, target: str, out: Path):
 
 
 def build_and_reply(zip_path: Path, msg_id: int, label: str):
-    workdir = WORK / f"j{int(time.time())}"
-    shutil.rmtree(workdir, ignore_errors=True)
-    workdir.mkdir(parents=True)
+    # One stable directory per zip name keeps ccache paths identical between
+    # uploads, which is what turns a 8% hit rate into ~100%.
+    workdir = WORK / safe_name(Path(label).stem)
     try:
         try:
-            with zipfile.ZipFile(zip_path) as z:
-                if len(z.namelist()) > 20000:
-                    send_message("⚠️ Zip quá nhiều file (>20000), đã bỏ qua.", msg_id)
-                    return
-                z.extractall(workdir / "src")
+            root, srcroot = sync_extract(zip_path, workdir / "src")
         except zipfile.BadZipFile:
             send_message("❌ File không phải zip hợp lệ (có thể bị zip lại?).", msg_id)
             return
+        except RuntimeError as e:
+            send_message(f"❌ {e}", msg_id)
+            return
 
-        root = find_project_root(workdir / "src")
         if root is None:
             send_message("❌ Không tìm thấy CMakeLists.txt trong zip.", msg_id)
             return
 
-        # Local build leftovers never help and only slow extraction.
-        for junk in ("build", "sdkconfig", "sdkconfig.old"):
-            shutil.rmtree(root / junk, ignore_errors=True)
-            if (root / junk).is_file():
-                (root / junk).unlink()
+        # Our own build/ and sdkconfig are KEPT between uploads so ninja does
+        # an incremental build. Anything the zip itself carries under those
+        # names was already filtered out during extraction.
 
         err = preflight(root)
         if err:
@@ -450,7 +540,10 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
         else:
             status.update(f"⏹ Dừng sau {dt}s.", force=True)
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        # NOT deleted: keeping this directory is what makes ccache and ninja
+        # work on the next upload. Only the downloaded zip is transient.
+        for leftover in workdir.glob("*.bin"):
+            leftover.unlink(missing_ok=True)
 
 
 def _escape(s):

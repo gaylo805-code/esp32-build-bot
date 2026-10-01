@@ -249,6 +249,78 @@ def main():
     check("empty log is safe", bot.extract_errors("") is not None)
     check("log without errors returns tail", "ninja" in bot.extract_errors("ninja failed"))
 
+    print("== find_project_root picks the project, not main/ ==")
+    # Zip WITHOUT a wrapping folder (files at top level) - the case that broke
+    # the bot, because "main" sorts before most project names.
+    flat = Path(tempfile.mkdtemp())
+    with zipfile.ZipFile(make_zip({"CMakeLists.txt": "x", "main/CMakeLists.txt": "y"})) as zf:
+        zf.extractall(flat)
+    got = bot.find_project_root(flat)
+    check("flat zip -> root, not main/", got == flat, got)
+    check("flat zip has main/", (got / "main").is_dir())
+
+    nested = Path(tempfile.mkdtemp())
+    with zipfile.ZipFile(make_zip({"aaa/main/CMakeLists.txt": "y",
+                                   "zzz/CMakeLists.txt": "x"})) as zf:
+        zf.extractall(nested)
+    got2 = bot.find_project_root(nested)
+    check("wrapper dir -> its child", got2 is not None and got2.name == "zzz", got2)
+
+    deep = Path(tempfile.mkdtemp())
+    with zipfile.ZipFile(make_zip({"a/b/proj/CMakeLists.txt": "x",
+                                   "a/b/proj/main/CMakeLists.txt": "y"})) as zf:
+        zf.extractall(deep)
+    got3 = bot.find_project_root(deep)
+    check("deeply nested zip found", got3 is not None and got3.name == "proj", got3)
+
+    check("no project -> None",
+          bot.find_project_root(Path(tempfile.mkdtemp())) is None)
+
+    print("== stable workspace (ccache depends on it) ==")
+    ws = Path(tempfile.mkdtemp()) / "src"
+    zA = make_zip({"p/CMakeLists.txt": "v1", "p/main/CMakeLists.txt": "x",
+                   "p/build/CMakeCache.txt": "junk",
+                   "p/sdkconfig": "junk"})
+    bot.sync_extract(zA, ws)
+    check("build/ from zip is dropped", not (ws / "p" / "build").exists())
+    check("sdkconfig from zip is dropped", not (ws / "p" / "sdkconfig").exists())
+    check("real sources extracted", (ws / "p" / "CMakeLists.txt").is_file())
+
+    # Second upload of the same project must land in the SAME paths.
+    root_before = str(bot.find_project_root(ws))
+    zB = make_zip({"p/CMakeLists.txt": "v2", "p/main/CMakeLists.txt": "x"})
+    bot.sync_extract(zB, ws)
+    check("path identical across uploads",
+          str(bot.find_project_root(ws)) == root_before, root_before)
+
+    # A file dropped in the new upload must not linger from the old one.
+    check("content updated in place",
+          (ws / "p" / "CMakeLists.txt").read_text() == "v2")
+
+    zC = make_zip({"p/CMakeLists.txt": "v3", "p/main/CMakeLists.txt": "x",
+                   "p/extra.h": "new"})
+    bot.sync_extract(zC, ws)
+    check("new file present after upload C", (ws / "p" / "extra.h").is_file())
+
+    # Upload D drops extra.h again: it must not linger and get compiled.
+    zD = make_zip({"p/CMakeLists.txt": "v4", "p/main/CMakeLists.txt": "x"})
+    bot.sync_extract(zD, ws)
+    check("stale files removed from previous upload",
+          not (ws / "p" / "extra.h").exists() and
+          (ws / "p" / "CMakeLists.txt").read_text() == "v4")
+
+    print("== zip safety ==")
+    evil = make_zip({"../escape.txt": "bad", "p/CMakeLists.txt": "x"})
+    try:
+        bot.sync_extract(evil, Path(tempfile.mkdtemp()) / "s")
+        check("path traversal rejected", False, "không raise")
+    except RuntimeError:
+        check("path traversal rejected", True)
+
+    print("== safe_name ==")
+    check("strips slashes", "/" not in bot.safe_name("a/b/c"))
+    check("keeps normal name", bot.safe_name("my-proj_v1") == "my-proj_v1")
+
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()
     calls = {"build": 0}
