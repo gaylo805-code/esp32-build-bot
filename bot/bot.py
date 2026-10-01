@@ -495,24 +495,50 @@ def build_target(root: Path, target: str, status=None, prefix=""):
 
 
 def merge_firmware(build_dir: Path, target: str, out: Path):
+    """Bundle bootloader + partition table + app into one flashable image.
+
+    ota_data_initial.bin only exists when the partition table declares OTA app
+    slots. Assembling the layout from what is actually on disk avoids a merge
+    failure on every non-OTA project that otherwise built fine.
+    """
     app = None
     for p in sorted(build_dir.glob("*.bin")):
         if not any(k in p.name for k in ("bootloader", "partition", "ota_data")):
             app = p
             break
     if app is None:
+        log("no application .bin found for merging")
         return None
+
+    bootloader = build_dir / "bootloader" / "bootloader.bin"
+    partition = build_dir / "partition_table" / "partition-table.bin"
+    ota = build_dir / "ota_data_initial.bin"
+
+    # Bootloader, partition table and app are all mandatory for a flashable
+    # image; only ota_data_initial.bin is optional.
+    if not (bootloader.is_file() and partition.is_file()):
+        missing = [n for n, p in (("bootloader.bin", bootloader),
+                                   ("partition-table.bin", partition))
+                   if not p.is_file()]
+        log(f"missing {missing}, cannot merge a flashable image")
+        return None
+
+    parts = [("0x0", bootloader), ("0x8000", partition)]
+    if ota.is_file():
+        parts.append(("0xe000", ota))
+    parts.append(("0x10000", app))
+
+    args = " ".join(f"{addr} {path}" for addr, path in parts)
     cmd = (
         f". {IDF_PATH}/export.sh && python -m esptool --chip {target} merge_bin "
         f"--format raw --flash_mode dio --flash_freq 40m --flash_size 4MB "
-        f"-o {out} "
-        f"0x0 {build_dir}/bootloader/bootloader.bin "
-        f"0x8000 {build_dir}/partition_table/partition-table.bin "
-        f"0xe000 {build_dir}/ota_data_initial.bin "
-        f"0x10000 {app}"
+        f"-o {out} {args}"
     )
     p = run(cmd, timeout=300)
-    return out if p.returncode == 0 and out.is_file() else None
+    if p.returncode != 0:
+        log(f"merge failed: {(p.stdout + p.stderr)[-400:]}")
+        return None
+    return out if out.is_file() else None
 
 
 def build_and_reply(zip_path: Path, msg_id: int, label: str):

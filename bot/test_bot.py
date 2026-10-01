@@ -10,6 +10,7 @@ import http.server
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -383,6 +384,58 @@ def main():
     check("no build.ninja -> must reconfigure",
           not (bot.configured_target(bt) == "esp32"
                and (bt / "build" / "build.ninja").is_file()))
+
+    print("== merge handles projects without OTA partitions ==")
+    # Regression: ota_data_initial.bin is hardcoded into the merge command.
+    # Non-OTA projects build fine but then fail at merge with
+    # "[Errno 2] No such file: build/ota_data_initial.bin".
+    mb = Path(tempfile.mkdtemp()) / "build"
+    (mb / "bootloader").mkdir(parents=True)
+    (mb / "partition_table").mkdir(parents=True)
+    (mb / "bootloader" / "bootloader.bin").write_bytes(b"\xe9" + b"\0" * 32)
+    (mb / "partition_table" / "partition-table.bin").write_bytes(b"\xaa" + b"\0" * 32)
+    (mb / "myapp.bin").write_bytes(b"\xbb" + b"\0" * 32)
+    check("no ota file present", not (mb / "ota_data_initial.bin").exists())
+    out = mb.parent / "merged.bin"
+    bot.esptool_stub = True
+    real_run = bot.run
+    captured = {}
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        captured["cmd"] = cmd
+        out.write_bytes(b"\xcc" * 64)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    bot.run = fake_run
+    try:
+        res = bot.merge_firmware(mb, "esp32", out)
+        cmd = captured.get("cmd", "")
+    finally:
+        bot.run = real_run
+    check("merge succeeds without ota_data", res is not None, res)
+    check("does not reference missing ota file",
+          "ota_data_initial" not in cmd, cmd[:160])
+    check("still includes bootloader + partition + app",
+          all(k in cmd for k in ("0x0", "0x8000", "0x10000")))
+
+    (mb / "ota_data_initial.bin").write_bytes(b"\xdd" + b"\0" * 32)
+    captured.clear()
+    bot.run = fake_run
+    try:
+        bot.merge_firmware(mb, "esp32s3", out)
+        cmd = captured.get("cmd", "")
+    finally:
+        bot.run = real_run
+    check("includes ota when present", "0xe000" in cmd and "ota_data_initial" in cmd)
+
+    (mb / "bootloader" / "bootloader.bin").unlink()
+    captured.clear()
+    bot.run = fake_run
+    try:
+        res2 = bot.merge_firmware(mb, "esp32", out)
+    finally:
+        bot.run = real_run
+    check("refuses to merge without bootloader", res2 is None, res2)
 
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()
