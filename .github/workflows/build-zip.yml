@@ -127,6 +127,11 @@ jobs:
           echo "ROOT=$ROOT" >> $GITHUB_ENV
           echo "Building project at: $ROOT"
 
+          # Drop local build leftovers from the zip. They are useless here
+          # (absolute paths from the author's machine) and set-target would
+          # wipe them anyway - removing now saves the time to unzip them.
+          rm -rf "$ROOT/build" "$ROOT/sdkconfig" "$ROOT/sdkconfig.old"
+
           # Preflight: catch the two most common zip mistakes with a clear
           # message instead of failing deep inside cmake/ninja.
           if [ ! -d "$ROOT/main" ]; then
