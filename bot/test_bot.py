@@ -365,6 +365,25 @@ def main():
     rc5, _ = bot.run_streaming("echo '[1/1] x'; kill -9 $$", cwd="/tmp")
     check("survives killed child", rc5 != 0)
 
+    print("== set-target skipped when target unchanged ==")
+    bt = Path(tempfile.mkdtemp())
+    (bt / "build").mkdir()
+    (bt / "build" / "build.ninja").write_text("")
+    (bt / "build" / "project_description.json").write_text('{"target": "esp32"}')
+    check("reads configured target", bot.configured_target(bt) == "esp32",
+          bot.configured_target(bt))
+    (bt / "build" / "project_description.json").write_text('{"target": "esp32s3"}')
+    check("detects different target", bot.configured_target(bt) == "esp32s3")
+    (bt / "build" / "project_description.json").unlink()
+    check("no description -> None", bot.configured_target(bt) is None)
+    (bt / "build" / "project_description.json").write_text("{not json")
+    check("broken json -> None, no crash", bot.configured_target(bt) is None)
+    (bt / "build" / "project_description.json").write_text('{"target": "esp32"}')
+    (bt / "build" / "build.ninja").unlink()
+    check("no build.ninja -> must reconfigure",
+          not (bot.configured_target(bt) == "esp32"
+               and (bt / "build" / "build.ninja").is_file()))
+
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()
     calls = {"build": 0}

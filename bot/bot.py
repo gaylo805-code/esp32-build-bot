@@ -425,16 +425,36 @@ def run_streaming(cmd, cwd, on_progress=None, timeout=2400):
     return rc, "".join(lines)
 
 
+def configured_target(root: Path):
+    """Return the target already configured in build/, or None."""
+    try:
+        import json as _json
+        p = root / "build" / "project_description.json"
+        if p.is_file():
+            return _json.loads(p.read_text()).get("target")
+    except Exception:
+        pass
+    return None
+
+
 def build_target(root: Path, target: str, status=None, prefix=""):
     """Build one target; return (ok, merged_bin_path_or_None, log_text)."""
     logdir = root / "build" / "log"
     try:
-        p1 = run(f". {IDF_PATH}/export.sh && idf.py "
-                 f"-DCMAKE_C_COMPILER_LAUNCHER=ccache "
-                 f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache set-target {target}",
-                 cwd=root, timeout=900)
-        if p1.returncode != 0:
-            return False, None, extract_errors(p1.stdout + p1.stderr)
+        # set-target wipes build/ and reconfigures CMake from scratch, which
+        # costs a full 40s rebuild every upload. Skip it when the existing
+        # build dir is already configured for this same target: ninja then
+        # rebuilds only the files that actually changed (~1s for one file).
+        current = configured_target(root)
+        if current == target and (root / "build" / "build.ninja").is_file():
+            log(f"{prefix or target}: build/ already set for {target}, skipping set-target")
+        else:
+            p1 = run(f". {IDF_PATH}/export.sh && idf.py "
+                     f"-DCMAKE_C_COMPILER_LAUNCHER=ccache "
+                     f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache set-target {target}",
+                     cwd=root, timeout=900)
+            if p1.returncode != 0:
+                return False, None, extract_errors(p1.stdout + p1.stderr)
 
         state = {"t0": time.time()}
 
