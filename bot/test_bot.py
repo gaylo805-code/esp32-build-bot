@@ -26,6 +26,7 @@ os.environ["TELEGRAM_FILE_BASE"] = "http://127.0.0.1:8799/file/botTESTTOKEN"
 import bot  # noqa: E402
 
 SENT = []
+EDITS = []
 SERVED = {}
 
 PROJECT_FILES = {
@@ -95,6 +96,13 @@ class Mock(http.server.BaseHTTPRequestHandler):
             return self._json({"ok": True, "result": {"username": "mockbot"}})
         if path.endswith("/getFile"):
             return self._json({"ok": True, "result": {"file_path": "docs/in.zip"}})
+        if path.endswith("/editMessageText"):
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+            EDITS.append(payload.get("text", ""))
+            return self._json({"ok": True, "result": {"message_id": 9}})
         if path.endswith("/getUpdates"):
             if "sent" not in SERVED:
                 SERVED["sent"] = True
@@ -204,14 +212,56 @@ def main():
           stdir.is_file() and stdir.read_text().strip() == "7")
     check("offset loadable after self-heal", bot.load_offset() == 7)
 
+    print("== progress bar ==")
+    check("0% = empty bar", bot.Status("").bar(0, 100) == "░" * 10,
+          bot.Status("").bar(0, 100))
+    check("50% = half bar", bot.Status("").bar(50, 100) == "▓" * 5 + "░" * 5,
+          bot.Status("").bar(50, 100))
+    check("100% = full bar", bot.Status("").bar(100, 100) == "▓" * 10,
+          bot.Status("").bar(100, 100))
+    check("clamped above 100", bot.Status("").bar(150, 100) == "▓" * 10)
+    check("no div by zero when total=0", isinstance(bot.Status("").bar(0, 0), str))
+
+    print("== ninja progress parsing ==")
+    check("parses [12/340]", bot.PROGRESS_RE.search("[12/340] Building C") is not None)
+    m = bot.PROGRESS_RE.search("[803/1150] Linking C executable")
+    check("extracts done,total", m and m.group(1) == "803" and m.group(2) == "1150")
+    check("ignores non-progress lines",
+          bot.PROGRESS_RE.search("ninja: build stopped") is None)
+
+    print("== streaming build output ==")
+    rc, out = bot.run_streaming(
+        "for i in 1 2 3; do echo \"[$i/3] step $i\"; done", cwd="/tmp")
+    check("streaming returns rc 0", rc == 0, rc)
+    check("captured all output", out.count("step") == 3, out)
+    seen = []
+    rc2, _ = bot.run_streaming(
+        "for i in 1 2 3; do echo \"[$i/3] s\"; done", cwd="/tmp",
+        on_progress=lambda d, t: seen.append((d, t)))
+    check("progress callback fired", seen == [(1, 3), (2, 3), (3, 3)], seen)
+
+    print("== extract_errors ==")
+    noisy = "\n".join([f"[{i}/900] Building C object x{i}" for i in range(500)])
+    log = noisy + "\nmain/web_server.c:217:75: error: format '%s' bad\nninja: build stopped"
+    ex = bot.extract_errors(log)
+    check("real error surfaced from noise", "web_server.c:217" in ex)
+    check("noise trimmed", ex.count("Building C object") <= 2, ex.count("Building C object"))
+    check("empty log is safe", bot.extract_errors("") is not None)
+    check("log without errors returns tail", "ninja" in bot.extract_errors("ninja failed"))
+
     print("== end-to-end poll loop (build stubbed) ==")
     SERVED["zip"] = z.read_bytes()
     calls = {"build": 0}
 
-    def fake_build(root, target):
+    def fake_build(root, target, status=None, prefix=""):
         calls["build"] += 1
         d = root / "build"
         d.mkdir(exist_ok=True)
+        if status:
+            for pct in (25, 50, 100):
+                status.update(
+                    f"🔨 {prefix} {status.bar(pct, 100)} {pct}% {pct}/100",
+                    force=True)
         return True, d, ""
 
     orig = bot.build_target
@@ -238,6 +288,11 @@ def main():
     check("caption names target", all(t in " ".join(d[1] + d[3] for d in docs)
                                       for t in ("esp32", "esp32s3")))
     check("acknowledged receipt", any("Đã nhận" in t for t in texts), texts[:2])
+    check("progress edits were sent", len(EDITS) >= 4, len(EDITS))
+    check("progress shows a bar", any("░" in e or "▓" in e for e in EDITS), EDITS[:2])
+    check("progress shows percentage", any("25%" in e or "50%" in e for e in EDITS))
+    check("progress names the target", any("esp32" in e for e in EDITS))
+    check("final status reports done", any("Hoàn tất" in e for e in EDITS), EDITS[-1:])
     check("no token leaked in text", all("TESTTOKEN" not in t for t in texts))
 
     srv.shutdown()

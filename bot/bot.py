@@ -10,6 +10,7 @@ runner for 6 hours when nobody is using the bot.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,45 @@ def api(method, payload=None, timeout=60):
     except Exception as e:  # network hiccup - caller retries
         log(f"error on {method}: {e}")
         return None
+
+
+class Status:
+    """A single Telegram message that is edited in place to show progress.
+
+    Editing one message avoids flooding the chat and stays well inside the
+    Bot API editMessageText rate limit.
+    """
+
+    BAR = "░░░░░░░░░░"
+
+    def __init__(self, initial, reply_to=None, min_interval=4.0):
+        self.reply_to = reply_to
+        self.min_interval = min_interval
+        self.message_id = None
+        self.last_text = None
+        self.last_send = 0.0
+        r = send_message(initial, reply_to)
+        if r and r.get("ok"):
+            self.message_id = r["result"]["message_id"]
+
+    def update(self, text, force=False):
+        now = time.time()
+        if not self.message_id:
+            return
+        if not force and now - self.last_send < self.min_interval:
+            return
+        if text == self.last_text:
+            return
+        self.last_send = now
+        self.last_text = text
+        api("editMessageText", {"chat_id": CHAT_ID, "message_id": self.message_id,
+                                "text": text, "disable_web_page_preview": True},
+            timeout=20)
+
+    def bar(self, done, total):
+        frac = (done / total) if total else 0.0
+        filled = max(0, min(10, round(frac * 10)))
+        return "▓" * filled + self.BAR[len("▓") * filled:]
 
 
 def send_message(text, reply_to=None):
@@ -237,7 +277,40 @@ def extract_errors(text):
     return text[-1200:]
 
 
-def build_target(root: Path, target: str):
+PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
+
+
+def run_streaming(cmd, cwd, on_progress=None, timeout=2400):
+    """Run under bash, streaming stdout so build progress can be reported.
+
+    Returns (returncode, combined_output). Uses bash because ESP-IDF's
+    export.sh is bash-only.
+    """
+    proc = subprocess.Popen(["/bin/bash", "-c", cmd], cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    lines = []
+    deadline = time.time() + timeout
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if on_progress:
+                m = PROGRESS_RE.search(line)
+                if m:
+                    on_progress(int(m.group(1)), int(m.group(2)))
+            if time.time() > deadline:
+                proc.kill()
+                return 124, "".join(lines)[-4000:]
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    proc.wait()
+    return proc.returncode, "".join(lines)
+
+
+def build_target(root: Path, target: str, status=None, prefix=""):
     """Build one target; return (ok, merged_bin_path_or_None, log_text)."""
     logdir = root / "build" / "log"
     try:
@@ -247,12 +320,29 @@ def build_target(root: Path, target: str):
                  cwd=root, timeout=900)
         if p1.returncode != 0:
             return False, None, extract_errors(p1.stdout + p1.stderr)
-        p2 = run(f". {IDF_PATH}/export.sh && idf.py "
-                 f"-DCMAKE_C_COMPILER_LAUNCHER=ccache "
-                 f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache build",
-                 cwd=root, timeout=1800)
-        if p2.returncode != 0:
-            return False, None, extract_errors(p2.stdout + p2.stderr)
+
+        state = {"t0": time.time()}
+
+        def cb(done, total):
+            if status is None:
+                return
+            pct = int(done * 100 / total) if total else 0
+            elapsed = int(time.time() - state["t0"])
+            rate = done / max(elapsed, 1)
+            eta = int((total - done) / rate) if rate > 0 and done else 0
+            status.update(
+                f"🔨 <b>{prefix}</b> {status.bar(done, total)} "
+                f"<b>{pct}%</b>  {done}/{total}\n"
+                f"⏱ {elapsed}s đã trôi qua · ETA ~{eta}s",
+                force=True)
+
+        rc, out = run_streaming(
+            f". {IDF_PATH}/export.sh && idf.py "
+            f"-DCMAKE_C_COMPILER_LAUNCHER=ccache "
+            f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache build",
+            cwd=root, on_progress=cb)
+        if rc != 0:
+            return False, None, extract_errors(out)
         logtxt = ""
         if logdir.is_dir():
             for f in sorted(logdir.glob("idf_py_std*")):
@@ -314,27 +404,36 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
             send_message(f"❌ Kiểm tra project thất bại: {err}", msg_id)
             return
 
-        send_message(f"⏳ Đã nhận `{label}`, bắt đầu build {', '.join(TARGETS)}...", msg_id)
+        status = Status(f"⏳ Đã nhận `{label}`\n\n🔨 Chuẩn bị build {', '.join(TARGETS)}...",
+                        msg_id)
         t0 = time.time()
         results = []
-        for target in TARGETS:
-            ok, build_dir, out = build_target(root, target)
-            if not ok:
+        for idx, target in enumerate(TARGETS):
+            ok, build_dir, out = build_target(
+                root, target, status=status,
+                prefix=f"[{idx+1}/{len(TARGETS)}] {target}")
+            if ok:
+                merged = merge_firmware(build_dir, target,
+                                        root / f"{root.name}-{target}.bin")
+                results.append((target, merged, out))
+                if merged:
+                    status.update(
+                        f"✅ <b>{target}</b> xong — "
+                        f"{merged.stat().st_size // 1024} KB\n"
+                        f"Tiếp tục target tiếp theo...", force=True)
+            else:
                 results.append((target, None, out))
-                continue
-            merged = merge_firmware(build_dir, target, root / f"{root.name}-{target}.bin")
-            results.append((target, merged, out))
+                break  # a broken project will break the next target too
         dt = int(time.time() - t0)
 
         for target, merged, out in results:
             if merged is None:
                 err_txt = extract_errors(out)
-                send_message(
+                status.update(
                     f"❌ <b>{target}</b> build lỗi sau {dt}s\n\n"
                     f"<pre>{_escape(err_txt)}</pre>\n\n"
-                    f"💡 Gửi lại zip đã sửa, hoặc xem file log đầy đủ.",
-                    msg_id,
-                )
+                    f"💡 Sửa lỗi rồi gửi lại zip.",
+                    force=True)
             else:
                 kb = merged.stat().st_size // 1024
                 upload_document(
@@ -345,11 +444,11 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
                     msg_id,
                 )
                 log(f"sent {merged.name} ({kb} KB)")
-        try:
-            api("sendMessage", {"chat_id": CHAT_ID, "text": f"⏱ Hoàn tất sau {dt}s.",
-                                "reply_to_message_id": msg_id})
-        except Exception:
-            pass
+        if all(r[1] for r in results):
+            status.update(f"✅ Hoàn tất {dt}s — đã gửi "
+                          f"{len(results)} file .bin.", force=True)
+        else:
+            status.update(f"⏹ Dừng sau {dt}s.", force=True)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
