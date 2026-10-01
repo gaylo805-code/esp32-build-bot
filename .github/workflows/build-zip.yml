@@ -30,7 +30,7 @@ jobs:
     env:
       IDF_VERSION: v5.1.4
       IDF_PATH: /opt/esp/idf
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_DIR: /home/runner/.cache/ccache
       CCACHE_MAXSIZE: 300M
       CCACHE_COMPRESS: '1'
 
@@ -49,10 +49,13 @@ jobs:
           restore-keys: |
             idf-${{ env.IDF_VERSION }}-toolchain-
 
+      # Same key AND same path as build.yml on purpose: both workflows compile
+      # essentially the same sources, so they share one ccache store instead of
+      # overwriting each other under a shared key.
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: /home/runner/.cache/ccache
           key: ccache-${{ matrix.target }}-${{ runner.os }}
 
       - name: Configure ccache
