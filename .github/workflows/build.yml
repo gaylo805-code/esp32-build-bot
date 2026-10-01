@@ -1,0 +1,110 @@
+name: Build ESP32
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: esp32
+            idf: v5.1.4
+          - target: esp32s3
+            idf: v5.1.4
+
+    env:
+      IDF_VERSION: ${{ matrix.idf }}
+      IDF_TARGET: ${{ matrix.target }}
+      # Cache key based only on version -> reused for every commit.
+      IDF_PATH: /opt/esp/idf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------
+      # 1) ESP-IDF toolchain (~2 GB) - the slowest part, cache forever.
+      #    Key does NOT include a commit hash, so this hits on every run.
+      # ---------------------------------------------------------------
+      - name: Cache ESP-IDF toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/esp/idf
+            ~/.espressif
+            ~/.platformio
+          key: idf-${{ matrix.idf }}-${{ matrix.target }}-toolchain-${{ runner.os }}
+          restore-keys: |
+            idf-${{ matrix.idf }}-${{ matrix.target }}-toolchain-
+            idf-${{ matrix.idf }}-toolchain-
+
+      - name: Cache build artifacts (incremental compile)
+        uses: actions/cache@v4
+        with:
+          path: |
+            build
+            ~/.cache/ccache
+          key: build-${{ matrix.target }}-${{ hashFiles('**/CMakeLists.txt', '**/*.c', '**/*.h', '**/*.cpp', 'sdkconfig.defaults', 'partitions.csv', 'main/idf_component.yml') }}
+          restore-keys: |
+            build-${{ matrix.target }}-
+            build-
+
+      - name: Set up ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=500M" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+          ccache --set-config=sloppiness=file_stat_matches,include_file_mtime,include_file_ctime,time_macros
+
+      - name: Install ESP-IDF (skipped on cache hit)
+        run: |
+          if [ -d "$IDF_PATH/tools" ] && [ -x "$IDF_PATH/export.sh" ]; then
+            echo "ESP-IDF toolchain restored from cache, skipping download."
+          else
+            git clone -b "$IDF_VERSION" --depth 1 --recursive \
+              https://github.com/espressif/esp-idf.git "$IDF_PATH"
+            cd "$IDF_PATH"
+            ./install.sh esp32,esp32s3
+          fi
+
+      - name: Export IDF environment
+        run: echo "IDF_PATH=$IDF_PATH" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target $IDF_TARGET
+          idf.py build
+
+      - name: Cache stats
+        if: always()
+        run: ccache -s || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+          path: |
+            build/*.bin
+            build/*.elf
+            build/partition_table/*.bin
+            build/bootloader/bootloader.bin
+          retention-days: 14
