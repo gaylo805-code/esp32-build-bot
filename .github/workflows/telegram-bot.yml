@@ -1,0 +1,120 @@
+name: Telegram Bot
+
+on:
+  schedule:
+    # Every 6 hours. The job itself runs up to ~5.5h and exits early when idle,
+    # so this just guarantees the bot comes back online.
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel a running bot: it would drop messages mid-build.
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    name: Poll Telegram and build
+    runs-on: ubuntu-latest
+    # GitHub caps a job at 6h; stay under it so logs get written properly.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    env:
+      IDF_VERSION: v5.1.4
+      IDF_PATH: /opt/esp/idf
+      CCACHE_DIR: /home/runner/.cache/ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: '1'
+      IDLE_EXIT_MINUTES: '30'
+      MAX_RUN_MINUTES: '340'
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_OFFSET_FILE: ${{ github.workspace }}/bot_state/offset
+      BOT_WORKDIR: ${{ github.workspace }}/bot_work
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache ESP-IDF toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/esp/idf
+            ~/.espressif
+          key: idf-${{ env.IDF_VERSION }}-toolchain-${{ runner.os }}
+          restore-keys: |
+            idf-${{ env.IDF_VERSION }}-toolchain-
+
+      # Rolling cache: restore the newest entry, save a new one each run.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-bot-${{ github.run_id }}
+          restore-keys: |
+            ccache-bot-
+
+      # Persisting the Telegram offset across restarts is what stops the bot
+      # from re-sending firmware for the same zip every time it wakes up.
+      - name: Restore bot state (Telegram offset)
+        uses: actions/cache/restore@v4
+        with:
+          path: bot_state
+          key: botstate-${{ github.run_id }}
+          restore-keys: |
+            botstate-
+
+      - name: Configure ccache
+        run: |
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ccache
+          fi
+          ccache --set-config=sloppiness=file_stat_matches,include_file_mtime,include_file_ctime,time_macros,locale
+
+      - name: Install ESP-IDF (skipped on cache hit)
+        run: |
+          MARKER="$IDF_PATH/.install-complete"
+          if [ -f "$MARKER" ] && [ -x "$IDF_PATH/export.sh" ]; then
+            echo "Toolchain restored from cache."
+          else
+            if [ -e "$IDF_PATH" ]; then
+              echo "Toolchain cache incomplete - wiping"
+              sudo rm -rf "$IDF_PATH"
+            fi
+            sudo mkdir -p "$IDF_PATH"
+            sudo chown -R "$(id -u):$(id -g)" "$IDF_PATH"
+            git clone -b "$IDF_VERSION" --depth 1 --recursive \
+              https://github.com/espressif/esp-idf.git "$IDF_PATH"
+            cd "$IDF_PATH"
+            ./install.sh esp32,esp32s3
+            touch "$MARKER"
+          fi
+
+      - name: Check secrets
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::error::Thiếu secret TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID"
+            exit 1
+          fi
+          echo "Secrets present (token length ${#TELEGRAM_BOT_TOKEN})."
+
+      - name: Run bot
+        run: python3 bot/bot.py
+
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bot_state
+          key: botstate-${{ github.run_id }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-bot-${{ github.run_id }}

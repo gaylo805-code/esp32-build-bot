@@ -1,75 +1,128 @@
-# esp32-fastbuild
+# ESP32 Build Bot
 
-Build firmware ESP32 bằng **ESP-IDF v5.1.4** trên GitHub Actions — **miễn phí** (repo public), có **cache nhiều tầng** để các lần build sau gần như tức thì.
+Build firmware ESP32 bằng **ESP-IDF v5.1.4** trên GitHub Actions — repo public nên **miễn phí**, có cache nhiều tầng để build sau gần như tức thì.
 
-## Cache 3 tầng — vì sao build nhanh
+Có 3 cách dùng:
+
+| Cách | Khi nào dùng |
+|---|---|
+| 🤖 **Telegram bot** (xem dưới) | Gửi `.zip` trong chat, nhận `.bin` về chat |
+| 📦 `uploads/` + push | Build dự án trong repo này |
+| 🔧 `workflow_dispatch` | Chạy tay từ tab Actions |
+
+---
+
+## 🤖 Telegram bot (cách chính)
+
+Gửi file `.zip` chứa project ESP-IDF vào chat → bot build cho `esp32` + `esp32s3` → trả lại **2 file `.bin` đã gộp**, mỗi target 1 file, flash ở offset `0x0`.
+
+Lệnh trong chat:
+
+| Lệnh | Tác dụng |
+|---|---|
+| `/start` | Hướng dẫn |
+| `/status` | Thời gian bot đã chạy / còn bao lâu nghỉ |
+
+### Cấu trúc zip
+
+```text
+ten_project.zip
+└── <tên thư mục tùy ý>/
+    ├── CMakeLists.txt        ← bắt buộc
+    ├── main/                 ← bắt buộc
+    │   ├── CMakeLists.txt
+    │   └── *.c
+    ├── partitions.csv            (tuỳ chọn)
+    ├── sdkconfig.defaults        (tuỳ chọn)
+    └── components/               (tuỳ chọn)
+```
+
+Tên thư mục gốc không quan trọng, không có thư mục bọc ngoài cũng được — bot tự dò `CMakeLists.txt`.
+Zip có kèm `build/` hay `sdkconfig` cũng không sao, bot tự xoá.
+
+### Cách bot hoạt động
+
+Bot **không chạy 24/7** — GitHub Actions là hệ thống chạy một lần rồi tắt, không phải server:
+
+- Job bắt đầu mỗi 6 giờ (`schedule: cron`), chạy tối đa ~5,5 giờ
+- Trong đó dùng **long-polling** Telegram, không tốn CPU
+- **Tự thoát sớm sau 30 phút không có tin nhắn** → không đốt runner khi không dùng
+- Lưu `offset` vào cache để restart không xử lý lại tin nhắn cũ
+- `concurrency` + `cancel-in-progress: false` để không huỷ build đang dở
+
+**Độ trễ thực tế:** gửi zip → nhận `.bin` trong **3–7 phút** (phần lớn thời gian là tải file + build).
+
+### Thiết lập secrets
+
+```bash
+gh secret set TELEGRAM_BOT_TOKEN --repo <owner>/<repo>
+gh secret set TELEGRAM_CHAT_ID   --repo <owner>/<repo>
+```
+
+- Token: [@BotFather](https://t.me/BotFather) → `/newbot`
+- Chat ID: nhắn bot bất kỳ rồi mở `https://api.telegram.org/bot<TOKEN>/getUpdates`, tìm `chat.id`
+
+Bot chỉ trả lời trong chat có `CHAT_ID` đã khai báo — ai khác gửi file sẽ bị bỏ qua.
+
+### Chạy thử
+
+```bash
+python3 bot/test_bot.py     # 17 test, dùng mock Telegram server, không cần token thật
+```
+
+Test bao phủ: dò thư mục gốc, preflight, xoá rác trong zip, escape HTML, lưu offset, và vòng lặp end-to-end.
+
+---
+
+## 📦 Cách 2: `uploads/`
+
+```bash
+cp ten.zip uploads/
+git add -A && git commit -m "ten" && git push
+```
+
+Push lên `main` mà đụng `uploads/*.zip` là workflow `build-zip.yml` tự chạy.
+Artifact tải ở tab Actions.
+
+---
+
+## Cache 3 tầng
 
 | Tầng | Cached gì | Key | Hiệu quả |
 |---|---|---|---|
-| 1 | `/opt/esp/idf`, `~/.espressif` (toolchain ~4.1 GB nén) | theo version, **không** theo commit, **dùng chung 2 target** | Bỏ clone + `install.sh` (6 phút → 0 giây) |
-| 2 | `~/.cache/ccache` (300 MB) | `ccache-<target>-<run_id>`, restore theo prefix | 100% hit ở mọi target |
+| 1 | `/opt/esp/idf`, `~/.espressif` (~2.4 GB) | theo version, **dùng chung mọi target** | Bỏ clone + `install.sh` (~6 phút → 0) |
+| 2 | `~/.cache/ccache` (300 MB) | `<prefix>-<run_id>`, restore theo prefix | **100% hit** ở cả `esp32`/`esp32s3` |
 | 3 | `build/` (109 MB) | theo target + hash source | Chỉ compile file thay đổi |
 
-### Vì sao key thiết kế như vậy
+Vài quyết định thiết kế đáng lưu ý:
 
-- **Tầng 1 dùng chung key cho cả `esp32` và `esp32s3`.** `install.sh esp32,esp32s3` chỉ cài *một* bộ toolchain, key theo target sẽ lưu 2 bản giống hệt ≈ 8.2 GB — gần kín quota 10 GB của repo, và GitHub evict theo LRU nên tầng quan trọng nhất sẽ bị xóa trước.
-  - Hệ quả: job thứ hai có thể log warning `another job may be creating this cache`. Đây là hành vi bình thường, **không** làm fail workflow.
-- **Tầng 2 phải là cache "rolling".** `actions/cache` chỉ ghi khi key chưa tồn tại; 2 matrix job chạy song song tranh một key sẽ tạo entry trùng và lookup trở nên không ổn định (đã gặp: 4 entry cùng key `ccache-esp32-Linux`, mọi run đều 0 hit). Cách đúng: `cache/restore` với `restore-keys` lấy bản mới nhất, rồi `cache/save` với key chứa `github.run_id`. Chỉ lưu khi build thật sự compile file mới — đọc `Misses` từ `ccache -s`, bằng 0 thì skip để không phình quota.
+- **Tầng 1 dùng chung key cho mọi target.** `install.sh esp32,esp32s3` chỉ cài *một* bộ toolchain. Key theo target sẽ lưu 2 bản giống hệt ≈ 8.2 GB, gần kín quota 10 GB và tầng giá trị nhất sẽ bị evict trước.
+- **Tầng 2 phải "rolling".** `actions/cache` chỉ ghi khi key chưa tồn tại; 2 job song song tranh một key sẽ tạo entry trùng và lookup hỏng (đã gặp: 4 entry cùng key `ccache-esp32-Linux`, mọi run đều 0 hit). Cách đúng: `cache/restore` lấy bản mới nhất + `cache/save` với key chứa `github.run_id`.
+- **Cache xoá sau 7 ngày không dùng.** Toolchain là tầng đắt nhất nên đừng bỏ repo im quá 1 tuần.
 
-Ngoài ra:
-- `concurrency` + `cancel-in-progress`: commit mới hủy build cũ, không tốn phút.
-- `idf.py set-target` chỉ chạy khi `build/` không được restore (nó xóa sạch `build/`).
-- Artifact `.bin` tải về bằng link trong Actions run.
+## Số đo thật
 
-### Vòng đời cache
+| Run | Thời gian |
+|---|---|
+| Lần đầu (tải toolchain 2.4 GB) | 4m19s |
+| Các run sau (cache ấm) | ~3m |
 
-GitHub **tự xóa** cache không được truy cập trong **7 ngày**. Tầng 1 an toàn khi build liên tục vì mỗi push đều chạm vào nó. Nếu bỏ không code hơn 1 tuần, lần build kế tiếp phải tải lại toolchain (~6 phút).
+ccache sau khi sửa: `esp32` 803/2408 hit, `esp32s3` 1684/2526 hit — tức **100% file được compile đều lấy từ cache**.
 
-## Số đo thực tế trên GitHub Actions (đã verify)
+Đo local: build lạnh 45s → build ấm 12.4s → incremental 5.3s.
 
-| Run | Thời gian | Ghi chú |
-|---|---|---|
-| Lần đầu | 4m19s | Tải toolchain 2.5 GB + build 2 target |
-| Các run sau | ~3m | Toolchain restore, ccache hit |
+## Cấu trúc
 
-### ccache sau khi sửa
-
-| Target | Hits (cumulative) | File compile ở run đó | Tỉ lệ hit |
-|---|---|---|---|
-| `esp32` | 803 / 2408 | 803 | **100%** |
-| `esp32s3` | 1684 / 2526 | 842 | **100%** |
-
-Đo local: build lạnh 45s → build ấm 12.4s (842/842 hit) → incremental 5.3s.
-
-## Dùng
-
-```bash
-git clone https://github.com/<owner>/esp32-fastbuild
-cd esp32-fastbuild
-# sửa code trong main/
-git push        # build tự chạy
 ```
-
-Firmware nằm ở artifact `firmware-esp32` / `firmware-esp32s3`.
-
-Flash: `idf.py -p /dev/ttyUSB0 flash monitor` (ESP-IDF cài local), hoặc dùng `espflash`/`esptool.py` với file `.bin` từ artifact.
-
-## Local build
-
-```bash
-git clone -b v5.1.4 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
-~/esp-idf/install.sh esp32,esp32s3 esp32s3
-. ~/esp-idf/export.sh
-idf.py set-target esp32
-idf.py build
+CMakeLists.txt          # project + bật ccache launcher (phải đặt TRƯỚC project())
+main/                   # code mẫu
+bot/bot.py              # Telegram bot
+bot/test_bot.py         # test với mock server
+.github/workflows/
+  build.yml             # build dự án trong repo
+  build-zip.yml         # build từ uploads/*.zip
+  telegram-bot.yml      # bot
+uploads/                # nơi đặt .zip
+sdkconfig.defaults
+partitions.csv
 ```
-
-## Thêm component / thư viện
-
-`idf.py add-dependency` cập nhật `dependencies.lock` và `main/idf_component.yml` — commit cả hai file để CI cài đúng version. Bước `idf.py build` tự pull component từ Component Registry và kết quả được cache ở tầng 1.
-
-## Tối ưu thêm nếu build vẫn chậm
-
-- **Dùng `restore-keys` rộng hơn** cho tầng 2 nếu đổi nhiều file (build/ cũ vẫn dùng được phần lớn .o).
-- **Tăng `CCACHE_MAXSIZE`** lên `2G` nếu repo có nhiều component.
-- **Chia job theo target** thay vì matrix khi repo lớn, để cache không bị ghi đè chéo.

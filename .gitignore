@@ -7,3 +7,7 @@ dependencies.lock
 *.elf
 *.map
 .DS_Store
+bot_work/
+bot_state/
+__pycache__/
+.env

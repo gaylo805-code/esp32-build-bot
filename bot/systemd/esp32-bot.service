@@ -1,0 +1,19 @@
+[Unit]
+Description=ESP32 Telegram build bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=runner
+WorkingDirectory=/home/runner/esp32-fastbuild
+EnvironmentFile=/home/runner/esp32-fastbuild/.env
+ExecStart=/home/runner/esp32-fastbuild/bot/run_local.sh
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+StandardOutput=append:/tmp/esp32-bot.log
+StandardError=append:/tmp/esp32-bot.log
+
+[Install]
+WantedBy=multi-user.target
