@@ -25,7 +25,9 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 IDF_PATH = os.environ.get("IDF_PATH", "/opt/esp/idf")
 IDF_VERSION = os.environ.get("IDF_VERSION", "v5.1.4")
 
-TARGETS = ["esp32", "esp32s3"]
+# Targets to build. Override with BOT_TARGETS="esp32,esp32s3" if you need more.
+TARGETS = [t.strip() for t in
+           os.environ.get("BOT_TARGETS", "esp32").split(",") if t.strip()]
 WORK = Path(os.environ.get("BOT_WORKDIR", "bot_work"))
 POLL_TIMEOUT = 50
 IDLE_EXIT_SECONDS = int(os.environ.get("IDLE_EXIT_MINUTES", "30")) * 60
@@ -602,9 +604,13 @@ def build_and_reply(zip_path: Path, msg_id: int, label: str):
                 kb = merged.stat().st_size // 1024
                 upload_document(
                     merged,
-                    f"✅ <b>{target}</b> — {kb} KB ({dt}s)\n"
-                    f"Flash 1 lần ở offset 0x0:\n"
-                    f"esptool.py -p /dev/ttyUSB0 write_flash 0x0 {merged.name}",
+                    f"📦 <b>{target}</b> — FILE ĐÃ GỘP ({kb} KB)\n"
+                    f"Đã gộp sẵn: bootloader + partition table"
+                    f"{' + OTA data' if (root / 'build' / 'ota_data_initial.bin').is_file() else ''}"
+                    f" + app.\n\n"
+                    f"⬇️ Tải file đính kèm này, flash 1 lần:\n"
+                    f"<code>esptool.py -p /dev/ttyUSB0 write_flash 0x0 {merged.name}</code>\n\n"
+                    f"⚠️ Không cần flash riêng file .bin nào khác.",
                     msg_id,
                 )
                 log(f"sent {merged.name} ({kb} KB)")

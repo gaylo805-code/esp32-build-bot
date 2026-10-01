@@ -470,16 +470,21 @@ def main():
 
     docs = [s for s in SENT if s[0] == "document"]
     texts = [s[1] for s in SENT if s[0] == "message"]
+    n = len(bot.TARGETS)
     check("bot exited cleanly", rc == 0, rc)
-    check("built both targets", calls["build"] == 2, calls["build"])
-    check("sent 2 merged .bin", len(docs) == 2, len(docs))
-    check("caption names target", all(t in " ".join(d[1] + d[3] for d in docs)
-                                      for t in ("esp32", "esp32s3")))
+    check("built every configured target", calls["build"] == n,
+          f"{calls['build']} != {n}")
+    check("sent one merged .bin per target", len(docs) == n, len(docs))
+    check("caption names every target",
+          all(t in " ".join(d[1] + d[3] for d in docs) for t in bot.TARGETS))
+    check("caption says file is merged",
+          all("GỘP" in d[3] for d in docs), [d[3][:60] for d in docs])
     check("acknowledged receipt", any("Đã nhận" in t for t in texts), texts[:2])
     check("progress edits were sent", len(EDITS) >= 4, len(EDITS))
     check("progress shows a bar", any("░" in e or "▓" in e for e in EDITS), EDITS[:2])
     check("progress shows percentage", any("25%" in e or "50%" in e for e in EDITS))
-    check("progress names the target", any("esp32" in e for e in EDITS))
+    check("progress names the target",
+          any(t in e for e in EDITS for t in bot.TARGETS))
     check("final status reports done", any("Hoàn tất" in e for e in EDITS), EDITS[-1:])
     check("no token leaked in text", all("TESTTOKEN" not in t for t in texts))
 
