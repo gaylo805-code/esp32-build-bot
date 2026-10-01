@@ -65,13 +65,24 @@ jobs:
 
       - name: Install ESP-IDF (skipped on cache hit)
         run: |
-          if [ -d "$IDF_PATH/tools" ] && [ -x "$IDF_PATH/export.sh" ]; then
-            echo "Toolchain restored from cache."
+          # Marker file is written only after a complete install. A cache
+          # restore can come back partially extracted, and git clone refuses
+          # to write into a non-empty dir - so wipe and reinstall instead.
+          MARKER="$IDF_PATH/.install-complete"
+          if [ -f "$MARKER" ] && [ -x "$IDF_PATH/export.sh" ]; then
+            echo "Toolchain restored from cache, skipping download."
           else
+            if [ -e "$IDF_PATH" ]; then
+              echo "Toolchain cache incomplete/stale - removing $IDF_PATH"
+              sudo rm -rf "$IDF_PATH"
+            fi
+            sudo mkdir -p "$IDF_PATH"
+            sudo chown -R "$(id -u):$(id -g)" "$IDF_PATH"
             git clone -b "$IDF_VERSION" --depth 1 --recursive \
               https://github.com/espressif/esp-idf.git "$IDF_PATH"
             cd "$IDF_PATH"
             ./install.sh esp32,esp32s3
+            touch "$MARKER"
           fi
 
       # Bỏ qua nếu chưa có zip nào trong uploads/
