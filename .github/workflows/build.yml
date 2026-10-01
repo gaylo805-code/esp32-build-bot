@@ -61,11 +61,17 @@ jobs:
       #    (esp32 and esp32s3 objects are not interchangeable) but has
       #    no per-commit granularity worth the storage.
       # ---------------------------------------------------------------
-      - name: Cache ccache
-        uses: actions/cache@v4
+      # Rolling ccache: actions/cache only writes when the key is brand new, and
+      # concurrent matrix jobs racing on one shared key create duplicate
+      # entries whose lookup is unreliable. Instead restore the newest
+      # previous entry and save under a run-unique key.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ccache
-          key: ccache-${{ matrix.target }}-${{ runner.os }}
+          path: /home/runner/.cache/ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-
 
       # ---------------------------------------------------------------
       # 3) Incremental build dir. Cached only when the source hash is new
@@ -147,9 +153,30 @@ jobs:
           path: build
           key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
-      - name: ccache stats
+      - name: Detect new ccache entries
+        id: ccache-new
         if: always()
-        run: ccache -s || echo "ccache not available on this runner"
+        run: |
+          ccache -s > stats.txt 2>&1 || true
+          cat stats.txt
+          MISS=$(grep -oE 'Misses:\s+[0-9]+' stats.txt | grep -oE '[0-9]+' | head -1)
+          MISS=${MISS:-0}
+          if [ "$MISS" -gt 0 ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "New objects compiled ($MISS misses) - will save ccache."
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Everything came from cache - skipping ccache save."
+          fi
+
+      # Only written when the build actually compiled something new, so a
+      # fully-cached rebuild does not add another entry to the repo quota.
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: steps.ccache-new.outputs.changed == 'true'
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4

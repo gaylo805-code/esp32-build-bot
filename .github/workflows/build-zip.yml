@@ -49,14 +49,17 @@ jobs:
           restore-keys: |
             idf-${{ env.IDF_VERSION }}-toolchain-
 
-      # Same key AND same path as build.yml on purpose: both workflows compile
-      # essentially the same sources, so they share one ccache store instead of
-      # overwriting each other under a shared key.
-      - name: Cache ccache
-        uses: actions/cache@v4
+      # Rolling ccache: actions/cache only writes when the key is brand new, and
+      # concurrent matrix jobs racing on one shared key create duplicate
+      # entries whose lookup is unreliable. Instead restore the newest
+      # previous entry and save under a run-unique key.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: /home/runner/.cache/ccache
-          key: ccache-${{ matrix.target }}-${{ runner.os }}
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-
 
       - name: Configure ccache
         run: |
@@ -175,9 +178,30 @@ jobs:
           echo "MERGED=$NAME" >> $GITHUB_ENV
           ls -la "$NAME"
 
-      - name: ccache stats
+      - name: Detect new ccache entries
+        id: ccache-new
         if: always() && steps.zip.outputs.found == 'true'
-        run: ccache -s || true
+        run: |
+          ccache -s > stats.txt 2>&1 || true
+          cat stats.txt
+          MISS=$(grep -oE 'Misses:\s+[0-9]+' stats.txt | grep -oE '[0-9]+' | head -1)
+          MISS=${MISS:-0}
+          if [ "$MISS" -gt 0 ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "New objects compiled ($MISS misses) - will save ccache."
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Everything came from cache - skipping ccache save."
+          fi
+
+      # Only written when the build actually compiled something new, so a
+      # fully-cached rebuild does not add another entry to the repo quota.
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: steps.ccache-new.outputs.changed == 'true'
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
 
       - name: Upload merged firmware
         if: steps.zip.outputs.found == 'true'
