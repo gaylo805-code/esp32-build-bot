@@ -121,6 +121,21 @@ jobs:
           echo "ROOT=$ROOT" >> $GITHUB_ENV
           echo "Building project at: $ROOT"
 
+          # Preflight: catch the two most common zip mistakes with a clear
+          # message instead of failing deep inside cmake/ninja.
+          if [ ! -d "$ROOT/main" ]; then
+            echo "::error::Thiếu thư mục main/ trong zip (project phải có main/CMakeLists.txt)"
+            exit 1
+          fi
+          if grep -q 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME' "$ROOT/sdkconfig.defaults" 2>/dev/null; then
+            CSV=$(grep 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME' "$ROOT/sdkconfig.defaults" | head -1 | cut -d'"' -f2)
+            if [ ! -f "$ROOT/$CSV" ]; then
+              echo "::error::sdkconfig.defaults trỏ tới '$CSV' nhưng file đó không có trong zip. Hãy thêm $CSV vào project rồi nén lại."
+              exit 1
+            fi
+          fi
+          echo "Preflight OK"
+
       - name: Build
         if: steps.zip.outputs.found == 'true'
         run: |
